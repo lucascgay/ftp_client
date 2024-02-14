@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+
+import io
+import socket
+import argparse
+import sys
+from urllib.parse import urlparse
+import re
+import os
+
+# Function to handle command line arguments
+def cmd_line():
+    parser = argparse.ArgumentParser(description="FTP command line")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("operation", choices=["ls", "rm", "rmdir", "mkdir", "cp", "mv"])
+    parser.add_argument("params", nargs="+", help="parameters for the operation")
+    args = parser.parse_args()
+
+    # Redirect stdout if verbose flag is not provided
+    if args.verbose == None:
+        global stdout_trash
+        stdout_trash = io.StringIO()
+        sys.stdout = stdout_trash
+
+    # Perform the FTP operation based on the provided arguments
+    if args.operation == "ls":
+        if len(args.params) != 1:
+            raise argparse.ArgumentTypeError('ls must have one parameter')
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            list(connect)
+    elif args.operation == "rm":
+        if len(args.params) != 1:
+            raise argparse.ArgumentTypeError("rm must have one parameter")
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            dele(connect)
+    elif args.operation == "rmdir":
+        if len(args.params) != 1:
+            raise argparse.ArgumentTypeError("rmdir must have one parameter")
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            rmd(connect)
+    elif args.operation == "mkdir":
+        if len(args.params) != 1:
+            raise argparse.ArgumentTypeError("mkdir must have one parameter")
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            mkd(connect)
+    elif args.operation == "cp":
+        if len(args.params) != 2:
+            raise argparse.ArgumentTypeError("cp must have two parameters")
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            if connect['up_down'] == "download":
+                retr(connect)
+            elif connect['up_down'] == "upload":
+                stor(connect)
+    elif args.operation == "mv":
+        if len(args.params) != 2:
+            raise argparse.ArgumentTypeError("mv must have two parameters")
+        else:
+            connect = parse_url(args.params)
+            control_connection(connect)
+            if connect['up_down'] == "download":
+                retr(connect)
+                dele(connect)
+            elif connect['up_down'] == "upload":
+                stor(connect)
+                os.remove(connect['loc_path'])
+
+        
+    quit()
+
+# Function to receive control messages from the server
+def receive_control():
+    chunks = []
+    end_criteria = b'\r\n'
+
+    while True:
+        chunk = control.recv(2048)
+        chunks.append(chunk)
+        if end_criteria in b''.join(chunks):
+            return b''.join(chunks)
+
+# Function to receive data from the server
+def receive_data():
+    chunks = []
+    
+    while True:
+        chunk = data.recv(2048)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    
+    return b''.join(chunks)
+
+# Function to send a message to the server
+def send_msg(sock, msg):
+    MSGLEN = len(msg)
+    msg = bytes(msg, 'utf-8')
+    totalsent = 0
+    while totalsent < MSGLEN:
+        sent = sock.send(msg[totalsent:])
+        if sent == 0:
+            raise RuntimeError('connection broken')
+        totalsent = totalsent + sent
+
+# Function to send a file to the server
+def send_file(sock, msg):
+    MSGLEN = len(msg)
+    totalsent = 0
+    while totalsent < MSGLEN:
+        sent = sock.send(msg[totalsent:])
+        if sent == 0:
+            raise RuntimeError('connection broken')
+        totalsent = totalsent + sent
+    
+    data.close()
+
+# Function to parse the URL parameters and decide upload or download functionality
+def parse_url(params):
+    if len(params) == 1:
+        connect = url_helper(params[0], None)
+    elif len(params) == 2:
+        if "ftp://" in params[0]:
+            connect = url_helper(params[0], params[1]) 
+            connect["up_down"] = "download"
+        else: 
+            connect = url_helper(params[1], params[0])
+            connect["up_down"] = "upload"
+
+    return connect
+
+# Function to parse the URL parameters used for various function calls  
+def url_helper(url, loc_path):
+    parse = urlparse(url)
+    if parse.netloc == None or parse.path == None:
+        raise argparse.ArgumentTypeError('badly formatted url')
+    else:
+        netloc = parse.netloc
+        path = parse.path
+        
+    pattern = re.compile(r"(?:([^:@]+)(?::([^@]+))?@)?([^:]+)(?::(\d+))?") 
+    match = pattern.match(netloc)
+    if match:
+        user, password, host, port = match.groups()
+        if port == None: port = 21
+        if user == None: user = "anonymous"
+    else:
+        print("No match")
+
+    connect = {
+        "user": user,
+        "password": password,
+        "host": host,
+        "port": int(port),
+        "path": path,
+        "loc_path": loc_path
+    }
+
+    return connect     
+
+# Function to establish the control connection
+def control_connection(connect):
+    global control
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    control.connect((connect['host'], connect['port']))
+
+    receive_control()
+
+    username = f"USER {connect['user']}\r\n"
+    send_msg(control, username)
+    usr = receive_control()
+    print(usr)
+
+    password = f"PASS {connect['password']}\r\n"
+    send_msg(control, password)
+    psw = receive_control()
+    print(psw)
+
+# Function to initiate a passive data connection
+def pasv():
+    global data
+    pasv = "PASV\r\n"
+    send_msg(control, pasv)
+    message = receive_control()
+    print(message)
+    message = message.decode('utf-8')
+
+    pattern = re.compile(r'\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)')
+    match = pattern.search(message)
+    if match:
+        ip1, ip2, ip3, ip4, port1, port2 = match.groups()
+        ip = f"{ip1}.{ip2}.{ip3}.{ip4}"
+        port1 = int(port1) << 8
+        port = port1 + int(port2)
+    else:
+        print("No match")
+
+    data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    data.connect((ip, port))
+
+# Function to close the FTP connection
+def quit():
+    quit = "QUIT\r\n"
+    print(quit)
+    send_msg(control, quit)
+    recv = receive_control()
+    print(recv)
+
+# Function to execute the LIST command on the server
+def list(connect):
+    pasv()
+    ls = f"LIST {connect['path']}\r\n"
+    print(ls)
+
+    send_msg(control, ls)
+    recv_control = receive_control()
+    print(recv_control)
+
+    recv_data = receive_data()
+    sys.stdout = sys.__stdout__
+    print(recv_data)
+    sys.stdout = stdout_trash
+
+    recv_control_two = receive_control()
+    print(recv_control_two)
+
+# Function to execute the MKDIR command on the server
+def mkd(connect):
+    mkd = f"MKD {connect['path']}\r\n"
+    print(mkd)
+
+    send_msg(control, mkd)
+    recv = receive_control()
+    print(recv)
+
+# Function to execute the RMDIR command on the server
+def rmd(connect):
+    rmd = f"RMD {connect['path']}\r\n"
+    print(rmd)
+
+    send_msg(control, rmd)
+    recv = receive_control()
+    print(recv)
+
+# Function that implements uploading functionality for mv and cp
+def stor(connect):
+    type = "TYPE I\r\n"
+    mode = "MODE S\r\n"
+    stru = "STRU F\r\n"
+    stor = f"STOR {connect['path']}\r\n"
+
+    send_msg(control, type)
+    recv_type = receive_control()
+    print(recv_type)
+
+    send_msg(control, mode)
+    recv_mode = receive_control()
+    print(recv_mode)
+
+    send_msg(control, stru)
+    recv_stru = receive_control()
+    print(recv_stru)
+
+    pasv()
+
+    send_msg(control, stor)
+    recv_stor = receive_control()
+    print(recv_stor)
+
+    file_data = stor_file_handler(connect)
+    
+    send_file(data, file_data)
+    recv_data = receive_control()
+    print(recv_data)
+
+# Creates the binary data from the file to be sent to the server
+def stor_file_handler(connect):
+    try:
+        with open(connect['loc_path'], 'rb') as file:
+            file_data = file.read()
+    except FileNotFoundError:
+        print(f"File '{connect['loc_path']}' not found.")
+
+    return file_data
+
+# Function to handle the download functionality of mv and cp
+def retr(connect):
+    #TYPE, MODE, and STRU 
+    type = "TYPE I\r\n"
+    mode = "MODE S\r\n"
+    stru = "STRU F\r\n"
+    retr = f"RETR {connect['path']}\r\n"
+
+    send_msg(control, type)
+    recv_type = receive_control()
+    print(recv_type)
+
+    send_msg(control, mode)
+    recv_mode = receive_control()
+    print(recv_mode)
+
+    send_msg(control, stru)
+    recv_stru = receive_control()
+    print(recv_stru)
+
+    pasv()
+
+    send_msg(control, retr)
+    recv_stor_control = receive_control()
+    print(recv_stor_control)
+
+    recv_stor_data = receive_data()
+    print(recv_stor_data)
+
+    retr_file_handler(connect, recv_stor_data)
+
+# Creates the file with the data on the local computer
+def retr_file_handler(connect, file_data):
+    with open(connect['loc_path'], 'wb') as file:
+        file.write(file_data)
+
+# Function to execute the RM command on the server
+def dele(connect):
+    dele = f"DELE {connect['path']}\r\n"
+    print(dele)
+
+    send_msg(control, dele)
+    recv = receive_control()
+    print(recv)
+
+# Triggers the program to start
+cmd_line()
